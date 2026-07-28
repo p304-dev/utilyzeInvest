@@ -1,0 +1,58 @@
+name: VC Research Worker
+
+on:
+  schedule:
+    # Every 30 minutes. Adjust once the backlog is under control.
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Log intended writes without touching the sheet"
+        type: boolean
+        default: false
+      requeue:
+        description: "Re-process rows already marked Needs Review or Error"
+        type: boolean
+        default: false
+      batch:
+        description: "Override BATCH_SIZE for this run"
+        type: string
+        default: ""
+
+jobs:
+  run-worker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write service account key
+        run: echo "$GOOGLE_SERVICE_ACCOUNT_JSON_B64" | base64 -d > service-account.json
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON_B64: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON_B64 }}
+
+      - name: Run vc_research worker
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GOOGLE_APPLICATION_CREDENTIALS: service-account.json
+          GOOGLE_PROJECT_ID: ${{ secrets.GOOGLE_PROJECT_ID }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          SHEET_TAB: ${{ vars.SHEET_TAB }}
+          GMAIL_ENABLED: ${{ vars.GMAIL_ENABLED }}
+          GMAIL_SENDER: ${{ vars.GMAIL_SENDER }}
+        run: |
+          ARGS="--worker vc_research"
+          if [ -n "${{ inputs.batch }}" ]; then ARGS="$ARGS --batch ${{ inputs.batch }}"; fi
+          if [ "${{ inputs.dry_run }}" = "true" ]; then ARGS="$ARGS --dry-run"; fi
+          if [ "${{ inputs.requeue }}" = "true" ]; then ARGS="$ARGS --requeue"; fi
+          python main.py $ARGS
+
+      - name: Clean up credentials
+        if: always()
+        run: rm -f service-account.json
