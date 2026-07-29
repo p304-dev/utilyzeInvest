@@ -5,6 +5,7 @@ trailing blank columns and headers that may shift.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Protocol
 
 import gspread
@@ -56,6 +57,25 @@ class SheetsClient:
         spreadsheet_id: str,
         sheet_tab: str,
     ) -> "SheetsClient":
+        path = Path(credentials_path)
+        if not path.exists():
+            raise RuntimeError(
+                f"Service account credentials file not found: {credentials_path!r}. "
+                "Check GOOGLE_APPLICATION_CREDENTIALS points at a real file."
+            )
+        if path.stat().st_size == 0:
+            raise RuntimeError(
+                f"Service account credentials file is empty: {credentials_path!r}. "
+                "In CI this usually means the GOOGLE_SERVICE_ACCOUNT_JSON_B64 secret "
+                "is unset or empty — check it's configured under repo Settings > "
+                "Secrets and variables > Actions."
+            )
+        if not spreadsheet_id:
+            raise RuntimeError(
+                "SHEET_ID is not set. Check the SHEET_ID secret/env var points at "
+                "the target spreadsheet's ID."
+            )
+
         creds = Credentials.from_service_account_file(credentials_path, scopes=_SCOPES)
         gc = gspread.authorize(creds)
         worksheet = gc.open_by_key(spreadsheet_id).worksheet(sheet_tab)

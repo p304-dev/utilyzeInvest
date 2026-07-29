@@ -42,7 +42,16 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Write service account key
-        run: echo "$GOOGLE_SERVICE_ACCOUNT_JSON_B64" | base64 -d > service-account.json
+        run: |
+          if [ -z "$GOOGLE_SERVICE_ACCOUNT_JSON_B64" ]; then
+            echo "::error::GOOGLE_SERVICE_ACCOUNT_JSON_B64 secret is not set. Add it under repo Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          echo "$GOOGLE_SERVICE_ACCOUNT_JSON_B64" | base64 -d > service-account.json
+          if [ ! -s service-account.json ]; then
+            echo "::error::GOOGLE_SERVICE_ACCOUNT_JSON_B64 decoded to an empty file — check it's valid base64 of the service-account JSON key."
+            exit 1
+          fi
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON_B64: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON_B64 }}
 
