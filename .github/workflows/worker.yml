@@ -1,9 +1,11 @@
 name: Automation Workers
 
 on:
-  schedule:
-    # Every 30 minutes. Adjust once each backlog is under control.
-    - cron: "*/30 * * * *"
+  # Scheduled cron trigger is paused until ANTHROPIC_API_KEY is funded and
+  # the required repo secrets are all configured (it was otherwise failing
+  # every 30 minutes). Re-enable by uncommenting the `schedule:` block below.
+  # schedule:
+  #   - cron: "*/30 * * * *"
   workflow_dispatch:
     inputs:
       worker:

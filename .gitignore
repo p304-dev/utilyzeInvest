@@ -10,4 +10,9 @@ venv/
 service-account*.json
 credentials*.json
 
+# GCP service-account keys downloaded from the console are named
+# <project-id>-<hash>.json — no legitimate JSON files are committed to
+# this repo, so ignore all of them rather than trying to enumerate names.
+*.json
+
 .DS_Store
