@@ -53,6 +53,10 @@ class VCResearchWorker(Worker):
         {"confidence", "source_urls", "notes", "draft_subject", "draft_body"}
     )
 
+    human_owned_columns = ["Status", "Contact Date", "Found"]
+    route_column = "Recommended_Channel"
+    extra_columns = ["Draft_Subject", "Draft_Body", "Draft_Status", "Draft_Link"]
+
     def build_prompt(self, row: dict[str, str], settings: Any) -> str:
         template = _PROMPT_PATH.read_text(encoding="utf-8")
         return (
@@ -75,12 +79,12 @@ class VCResearchWorker(Worker):
         self,
         row: dict[str, str],
         result: BaseModel,
-        channel: str,
+        route_value: str,
         settings: Any,
     ) -> dict[str, str]:
         assert isinstance(result, VCResearchResult)
 
-        if channel == CHANNEL_EMAIL and result.email and settings.gmail_enabled:
+        if route_value == CHANNEL_EMAIL and result.email and settings.gmail_enabled:
             from gmail.client import GmailClient
 
             gmail_client = GmailClient(

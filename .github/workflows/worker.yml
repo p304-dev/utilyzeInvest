@@ -1,11 +1,16 @@
-name: VC Research Worker
+name: Automation Workers
 
 on:
   schedule:
-    # Every 30 minutes. Adjust once the backlog is under control.
+    # Every 30 minutes. Adjust once each backlog is under control.
     - cron: "*/30 * * * *"
   workflow_dispatch:
     inputs:
+      worker:
+        description: "Which worker to run manually (scheduled runs always run both)"
+        type: choice
+        options: [vc_research, grants]
+        default: vc_research
       dry_run:
         description: "Log intended writes without touching the sheet"
         type: boolean
@@ -22,6 +27,10 @@ on:
 jobs:
   run-worker:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        worker: ${{ github.event_name == 'workflow_dispatch' && fromJSON(format('["{0}"]', inputs.worker)) || fromJSON('["vc_research", "grants"]') }}
+      fail-fast: false
     steps:
       - uses: actions/checkout@v4
 
@@ -37,17 +46,16 @@ jobs:
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON_B64: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON_B64 }}
 
-      - name: Run vc_research worker
+      - name: Run ${{ matrix.worker }} worker
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GOOGLE_APPLICATION_CREDENTIALS: service-account.json
           GOOGLE_PROJECT_ID: ${{ secrets.GOOGLE_PROJECT_ID }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
-          SHEET_TAB: ${{ vars.SHEET_TAB }}
           GMAIL_ENABLED: ${{ vars.GMAIL_ENABLED }}
           GMAIL_SENDER: ${{ vars.GMAIL_SENDER }}
         run: |
-          ARGS="--worker vc_research"
+          ARGS="--worker ${{ matrix.worker }}"
           if [ -n "${{ inputs.batch }}" ]; then ARGS="$ARGS --batch ${{ inputs.batch }}"; fi
           if [ "${{ inputs.dry_run }}" = "true" ]; then ARGS="$ARGS --dry-run"; fi
           if [ "${{ inputs.requeue }}" = "true" ]; then ARGS="$ARGS --requeue"; fi

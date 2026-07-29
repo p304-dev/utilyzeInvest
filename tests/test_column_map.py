@@ -6,7 +6,7 @@ import pytest
 
 from config.settings import Settings
 from framework.runner import RunnerOptions, run
-from framework.worker_base import FRAMEWORK_COLUMNS, HUMAN_OWNED_COLUMNS
+from framework.worker_base import CORE_COLUMNS, RUNNER_DIRECT_COLUMNS
 from sheets.client import MissingColumnError, ROW_NUMBER_KEY, SheetsClient
 from tests.fixtures.fake_llm import FakeLLMClient
 from tests.fixtures.fake_sheets import FakeSheetsClient
@@ -44,14 +44,13 @@ def _make_sheet(headers: list[str], data_rows: list[list[str]]) -> SheetsClient:
 
 def test_worker_column_map_never_targets_human_owned_columns():
     worker = VCResearchWorker()
-    assert not (set(worker.column_map.values()) & set(HUMAN_OWNED_COLUMNS))
+    assert not (set(worker.column_map.values()) & set(worker.human_owned_columns))
 
 
-def test_worker_column_map_never_targets_runner_managed_columns():
-    from framework.worker_base import RUNNER_MANAGED_COLUMNS
-
+def test_worker_column_map_never_targets_runner_direct_columns():
     worker = VCResearchWorker()
-    assert not (set(worker.column_map.values()) & set(RUNNER_MANAGED_COLUMNS))
+    reserved = set(RUNNER_DIRECT_COLUMNS) | {worker.route_column}
+    assert not (set(worker.column_map.values()) & reserved)
 
 
 # -- header resolution: shuffled order + trailing blanks -----------------
@@ -88,16 +87,16 @@ def test_ensure_columns_fills_trailing_blank_slots_before_appending():
 
 def test_ensure_columns_is_idempotent():
     sheet = _make_sheet(["Investor Name", "Bot_Status"], [["Acme", "Queued"]])
-    sheet.ensure_columns(FRAMEWORK_COLUMNS)
+    sheet.ensure_columns(CORE_COLUMNS)
     headers_after_first = list(sheet._headers)
-    sheet.ensure_columns(FRAMEWORK_COLUMNS)
+    sheet.ensure_columns(CORE_COLUMNS)
     assert sheet._headers == headers_after_first
 
 
-def test_ensure_columns_creates_all_framework_columns_on_a_bare_sheet():
+def test_ensure_columns_creates_all_core_columns_on_a_bare_sheet():
     sheet = _make_sheet(["Investor Name", "Website"], [["Acme", "acme.vc"]])
-    sheet.ensure_columns(FRAMEWORK_COLUMNS)
-    for header in FRAMEWORK_COLUMNS:
+    sheet.ensure_columns(CORE_COLUMNS)
+    for header in CORE_COLUMNS:
         assert sheet.has_column(header)
 
 

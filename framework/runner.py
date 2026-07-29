@@ -22,8 +22,6 @@ from framework.worker_base import (
     BOT_STATUS_NEEDS_REVIEW,
     BOT_STATUS_QUEUED_EXPLICIT,
     BOT_STATUS_RESEARCHING,
-    FRAMEWORK_COLUMNS,
-    HUMAN_OWNED_COLUMNS,
     TERMINAL_BOT_STATUSES,
     Worker,
 )
@@ -79,14 +77,6 @@ def select_queue(
     return queue
 
 
-def _format_value(value: Any) -> str:
-    if isinstance(value, list):
-        return "\n".join(str(v) for v in value)
-    if isinstance(value, float):
-        return f"{value:.2f}"
-    return str(value)
-
-
 def _build_success_updates(
     row: dict[str, str],
     result: BaseModel,
@@ -95,16 +85,7 @@ def _build_success_updates(
     options: RunnerOptions,
     today: str,
 ) -> tuple[dict[str, str], str]:
-    updates: dict[str, str] = {}
-
-    for field_name, header in worker.column_map.items():
-        value = getattr(result, field_name)
-        if value is None:
-            continue
-        always_overwrite = field_name in worker.always_overwrite_fields
-        currently_blank = not row.get(header)
-        if always_overwrite or currently_blank or options.force_refresh:
-            updates[header] = _format_value(value)
+    updates = worker.compute_business_updates(result, row, options.force_refresh)
 
     confidence = getattr(result, "confidence")
     notes = updates.get("Research_Notes", "") or ""
@@ -117,26 +98,28 @@ def _build_success_updates(
     else:
         bot_status = BOT_STATUS_NEEDS_REVIEW
 
-    channel = worker.route(result)
+    route_value = worker.route(result)
 
-    updates["Recommended_Channel"] = channel
+    updates[worker.route_column] = route_value
     updates["Bot_Status"] = bot_status
     updates["Last_Checked"] = today
 
-    extra = worker.after_research(row, result, channel, settings)
+    extra = worker.after_research(row, result, route_value, settings)
     updates.update(extra)
 
     return updates, bot_status
 
 
-def _assert_no_human_owned_writes(updates: dict[str, str]) -> None:
-    violations = set(updates) & set(HUMAN_OWNED_COLUMNS)
+def _assert_no_human_owned_writes(updates: dict[str, str], worker: Worker) -> None:
+    violations = set(updates) & set(worker.human_owned_columns)
     if violations:
         raise AssertionError(f"Refusing to write human-owned columns: {violations}")
 
 
-def _write(sheets_client: Any, row_number: int, updates: dict[str, str], dry_run: bool) -> None:
-    _assert_no_human_owned_writes(updates)
+def _write(
+    sheets_client: Any, worker: Worker, row_number: int, updates: dict[str, str], dry_run: bool
+) -> None:
+    _assert_no_human_owned_writes(updates, worker)
     if not updates:
         return
     if dry_run:
@@ -158,6 +141,7 @@ def _process_row(
 
     _write(
         sheets_client,
+        worker,
         row_number,
         {"Bot_Status": BOT_STATUS_RESEARCHING, "Last_Checked": today},
         options.dry_run,
@@ -181,6 +165,7 @@ def _process_row(
         reason = " | ".join(errors)[:_NOTES_TRUNCATE]
         _write(
             sheets_client,
+            worker,
             row_number,
             {
                 "Bot_Status": BOT_STATUS_ERROR,
@@ -193,7 +178,7 @@ def _process_row(
         return BOT_STATUS_ERROR
 
     updates, bot_status = _build_success_updates(row, result, worker, settings, options, today)
-    _write(sheets_client, row_number, updates, options.dry_run)
+    _write(sheets_client, worker, row_number, updates, options.dry_run)
     log_event(logger, "row_processed", row=row_number, bot_status=bot_status)
     return bot_status
 
@@ -205,11 +190,10 @@ def run(
     settings: Any,
     options: RunnerOptions,
 ) -> RunSummary:
-    sheets_client.ensure_columns(FRAMEWORK_COLUMNS)
+    owned = set(worker.owned_columns)
+    sheets_client.ensure_columns(worker.owned_columns)
     sheets_client.require_columns(worker.input_columns)
-    sheets_client.require_columns(
-        [h for h in worker.column_map.values() if h not in FRAMEWORK_COLUMNS]
-    )
+    sheets_client.require_columns([h for h in worker.column_map.values() if h not in owned])
 
     rows = sheets_client.read_all_rows()
     queue = select_queue(rows, worker, options)

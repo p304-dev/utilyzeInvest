@@ -14,10 +14,12 @@ from framework.runner import RunnerOptions, run
 from framework.worker_base import Worker
 from llm.client import LLMClient
 from sheets.client import SheetsClient
+from workers.grants.worker import GrantsWorker
 from workers.vc_research.worker import VCResearchWorker
 
 WORKER_REGISTRY: dict[str, type[Worker]] = {
     "vc_research": VCResearchWorker,
+    "grants": GrantsWorker,
 }
 
 
