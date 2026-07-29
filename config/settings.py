@@ -10,8 +10,9 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -43,6 +44,16 @@ class Settings(BaseSettings):
     utilyze_context_file: str = "config/utilyze_context.md"
 
     log_level: str = "INFO"
+
+    @field_validator("gmail_enabled", mode="before")
+    @classmethod
+    def _blank_env_means_default(cls, value: Any) -> Any:
+        # An unset GitHub Actions repo/environment variable interpolates to
+        # "" rather than being absent, which pydantic's bool parser rejects
+        # outright. Treat blank the same as unset (falls back to False).
+        if isinstance(value, str) and value.strip() == "":
+            return False
+        return value
 
     @property
     def utilyze_context(self) -> str:

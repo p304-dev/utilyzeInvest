@@ -52,8 +52,11 @@ jobs:
           GOOGLE_APPLICATION_CREDENTIALS: service-account.json
           GOOGLE_PROJECT_ID: ${{ secrets.GOOGLE_PROJECT_ID }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
-          GMAIL_ENABLED: ${{ vars.GMAIL_ENABLED }}
-          GMAIL_SENDER: ${{ vars.GMAIL_SENDER }}
+          # vars.* interpolates to "" (not unset) when the repo/environment
+          # variable was never configured — fall back explicitly so we
+          # never hand Settings a blank value for a typed field.
+          GMAIL_ENABLED: ${{ vars.GMAIL_ENABLED || 'false' }}
+          GMAIL_SENDER: ${{ vars.GMAIL_SENDER || 'ana.valentino@utilyze.ai' }}
         run: |
           ARGS="--worker ${{ matrix.worker }}"
           if [ -n "${{ inputs.batch }}" ]; then ARGS="$ARGS --batch ${{ inputs.batch }}"; fi
