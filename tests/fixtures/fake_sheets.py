@@ -30,6 +30,9 @@ class FakeSheetsClient:
     def has_column(self, header: str) -> bool:
         return header in self.headers
 
+    def column_index(self, header: str) -> int:
+        return self.headers.index(header) + 1
+
     def require_columns(self, headers: list[str]) -> None:
         missing = [h for h in headers if h not in self.headers]
         if missing:

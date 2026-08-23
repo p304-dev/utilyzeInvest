@@ -4,7 +4,6 @@ import json
 
 from config.settings import Settings
 from framework.runner import RunnerOptions, run
-from framework.worker_base import RUNNER_DIRECT_COLUMNS
 from tests.fixtures.fake_llm import FakeLLMClient
 from tests.fixtures.fake_sheets import FakeSheetsClient
 from workers.grants.worker import GrantsWorker
@@ -31,7 +30,7 @@ def _run_once(rows, response_json, force_refresh=False):
     sheet = FakeSheetsClient(rows, headers=list(BASE_HEADERS))
     llm = FakeLLMClient([response_json])
     worker = GrantsWorker()
-    settings = Settings()
+    settings = Settings(_env_file=None, fetch_first=False)
     options = RunnerOptions(batch_size=5, force_refresh=force_refresh)
     run(worker, sheet, llm, settings, options)
     return sheet
@@ -61,9 +60,17 @@ def _response(**overrides) -> str:
 
 def test_grants_worker_column_map_never_targets_human_owned_or_direct_columns():
     worker = GrantsWorker()
-    reserved = set(RUNNER_DIRECT_COLUMNS) | {worker.route_column}
+    reserved = {"Bot_Status", worker.timestamp_column, worker.route_column}
     assert not (set(worker.column_map.values()) & set(worker.human_owned_columns))
     assert not (set(worker.column_map.values()) & reserved)
+
+
+def test_grants_has_no_queue_formula_and_no_sentinels():
+    # The Grants / Pitches tab has no COUNTBLANK-driven queue column, so
+    # this worker keeps the blank-scanning fallback and writes no sentinels.
+    worker = GrantsWorker()
+    assert worker.queue_column is None
+    assert worker.sentinel_columns == frozenset()
 
 
 def test_grants_runner_never_writes_human_owned_columns():
@@ -102,7 +109,7 @@ def test_grants_runner_composite_columns_and_bookkeeping_always_present():
     assert final_row["Source_URLs"] == "https://example.org"
     assert final_row["Bot_Status"] == "Needs Review"
     assert final_row["Recommended_Action"] == "Watch"
-    assert final_row["Last_Checked"]
+    assert final_row["Last Checked"]
 
 
 def test_grants_runner_not_eligible_routes_to_skip():
@@ -117,7 +124,7 @@ def test_grants_runner_error_after_exhausted_retries_writes_no_business_columns(
     sheet = FakeSheetsClient(rows, headers=list(BASE_HEADERS))
     llm = FakeLLMClient(["not json", "still not json", "nope"])
     worker = GrantsWorker()
-    settings = Settings()
+    settings = Settings(_env_file=None, fetch_first=False)
     options = RunnerOptions(batch_size=5)
     run(worker, sheet, llm, settings, options)
 

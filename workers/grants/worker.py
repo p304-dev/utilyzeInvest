@@ -2,9 +2,15 @@
 and fit/eligibility-based action routing for the Grants / Pitches tab.
 
 Research-only — no channel routing to a person, no drafting to a send
-step. Reuses the entire framework (runner, Sheets client, validation,
-Bot_Status queue) unchanged; only the schema, column map, scoring, and
-prompt differ from vc_research.
+step. Reuses the entire framework (runner, Sheets client, validation)
+unchanged; only the schema, column map, scoring, and prompt differ from
+vc_research.
+
+Unlike the Investors tab, Grants / Pitches has no queue formula column, so
+this worker leaves `queue_column` unset and the runner falls back to
+scanning for blank business columns. The sentinel rule is likewise not
+applied here: without a COUNTBLANK-driven formula there is nothing to
+satisfy, and writing "None" into empty cells would only add noise.
 """
 
 from __future__ import annotations

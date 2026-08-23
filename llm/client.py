@@ -35,6 +35,35 @@ class LLMClient:
         self._max_tokens = max_tokens
         self._web_search_max_uses = web_search_max_uses
 
+    def extract(self, prompt: str, page_text: str) -> str:
+        """Answer the same prompt from already-fetched page text, with no
+        web-search tool. Same JSON contract as research(), a fraction of
+        the cost — fields the page doesn't cover come back null and the
+        caller decides whether that's enough."""
+        message = (
+            f"{prompt}\n\n"
+            "---\n"
+            "Use ONLY the page content below. Do not use outside knowledge. "
+            "Set any field the page does not support to null, and put the "
+            "page's own URL in source_urls.\n\n"
+            "--- BEGIN PAGE CONTENT ---\n"
+            f"{page_text}\n"
+            "--- END PAGE CONTENT ---"
+        )
+        response = self._client.messages.create(
+            model=self._model,
+            max_tokens=self._max_tokens,
+            output_config={"effort": self._effort},
+            messages=[{"role": "user", "content": message}],
+        )
+        if response.stop_reason == "refusal":
+            details = response.stop_details
+            raise LLMRefusalError(
+                getattr(details, "category", None) if details else None,
+                getattr(details, "explanation", None) if details else None,
+            )
+        return "".join(block.text for block in response.content if block.type == "text")
+
     def research(self, prompt: str) -> str:
         """Single research call with web search enabled. Returns the
         concatenated text of the final response's text blocks. Transparently

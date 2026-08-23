@@ -1,11 +1,12 @@
 name: Automation Workers
 
 on:
-  # Scheduled cron trigger is paused until ANTHROPIC_API_KEY is funded and
-  # the required repo secrets are all configured (it was otherwise failing
-  # every 30 minutes). Re-enable by uncommenting the `schedule:` block below.
-  # schedule:
-  #   - cron: "*/30 * * * *"
+  schedule:
+    # Biweekly: 09:00 UTC on the 1st and 15th. The sheet's queue formula
+    # makes runs self-limiting — the first few clear the ~968-row backfill
+    # at BATCH_SIZE rows apiece, then each run only picks up rows that
+    # went stale (Last Checked older than 90 days) or were newly added.
+    - cron: "0 9 1,15 * *"
   workflow_dispatch:
     inputs:
       worker:
@@ -61,7 +62,6 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GOOGLE_APPLICATION_CREDENTIALS: service-account.json
-          GOOGLE_PROJECT_ID: ${{ secrets.GOOGLE_PROJECT_ID }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
           # vars.* interpolates to "" (not unset) when the repo/environment
           # variable was never configured — fall back explicitly so we

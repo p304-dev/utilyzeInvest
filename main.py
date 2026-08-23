@@ -1,6 +1,7 @@
 """CLI entry point for the Utilyze automation workers.
 
     python main.py --worker vc_research [--batch N] [--force-refresh] [--requeue] [--dry-run]
+    python main.py --worker vc_research --publish [--dry-run]
 """
 
 from __future__ import annotations
@@ -32,19 +33,60 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--force-refresh",
         action="store_true",
-        help="Overwrite non-blank worker-writable business cells",
+        help="Process regardless of the queue column, overwriting filled business cells",
     )
     parser.add_argument(
         "--requeue",
         action="store_true",
-        help="Re-process rows already marked Needs Review or Error",
+        help="Include rows previously marked Error",
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Log intended writes without touching the sheet",
+        help="Log intended writes without touching the sheet or Wix",
+    )
+    parser.add_argument(
+        "--publish",
+        action="store_true",
+        help="Publish researched rows to Wix instead of researching. Never runs research.",
     )
     return parser.parse_args(argv)
+
+
+def _publish(worker: Worker, settings, logger, dry_run: bool) -> int:
+    from wix.publish import build_client, publish_rows
+
+    sheets_client = SheetsClient.from_service_account(
+        credentials_path=settings.google_application_credentials,
+        spreadsheet_id=settings.sheet_id,
+        sheet_tab=worker.sheet_tab,
+    )
+    if not worker.queue_column:
+        log_event(
+            logger,
+            "publish_unsupported",
+            worker=worker.name,
+            reason="worker has no queue column to decide what is publishable",
+            level="ERROR",
+        )
+        return 1
+
+    rows = sheets_client.read_all_rows()
+    summary = publish_rows(
+        rows,
+        build_client(settings),
+        queue_column=worker.queue_column,
+        dry_run=dry_run,
+    )
+    log_event(
+        logger,
+        "publish_complete",
+        worker=worker.name,
+        published=summary.published,
+        skipped=summary.skipped,
+        errors=summary.errors,
+    )
+    return 1 if summary.errors else 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -53,6 +95,10 @@ def main(argv: list[str] | None = None) -> int:
     logger = get_logger("utilyze.main", level=settings.log_level)
 
     worker = WORKER_REGISTRY[args.worker]()
+    worker.configure(settings)
+
+    if args.publish:
+        return _publish(worker, settings, logger, args.dry_run)
 
     sheets_client = SheetsClient.from_service_account(
         credentials_path=settings.google_application_credentials,
@@ -81,7 +127,6 @@ def main(argv: list[str] | None = None) -> int:
         "run_complete",
         worker=worker.name,
         processed=summary.processed,
-        needs_review=summary.needs_review,
         errors=summary.errors,
         skipped=summary.skipped,
         queue_size=summary.queue_size,

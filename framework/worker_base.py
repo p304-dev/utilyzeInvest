@@ -10,35 +10,41 @@ from typing import Any
 
 from pydantic import BaseModel
 
-# Columns every worker shares, regardless of sheet/tab: queue state,
-# worker-assessed confidence/sources/notes, and the last-processed
-# timestamp. Always auto-created (see sheets/client.py: ensure_columns).
-# Confidence/Source_URLs/Research_Notes are ordinarily populated via a
-# worker's column_map / compute_business_updates() (they hold the LLM's
-# own assessment); Bot_Status and Last_Checked are the two the runner
-# always writes directly (see RUNNER_DIRECT_COLUMNS below).
+# Bot-owned bookkeeping columns every worker shares. Auto-created to the
+# right of all existing data if missing (see sheets/client.py:
+# ensure_columns). Confidence/Source_URLs/Research_Notes are populated via
+# a worker's column_map / compute_business_updates(); Bot_Status is written
+# directly by the runner.
 CORE_COLUMNS: list[str] = [
     "Bot_Status",
     "Confidence",
     "Source_URLs",
     "Research_Notes",
-    "Last_Checked",
 ]
 
-# The subset of CORE_COLUMNS (plus each worker's route_column) the runner
-# writes directly, never via column_map / compute_business_updates() — a
-# worker's column_map may never target these.
-RUNNER_DIRECT_COLUMNS: list[str] = ["Bot_Status", "Last_Checked"]
-
-BOT_STATUS_QUEUED = ""
-BOT_STATUS_QUEUED_EXPLICIT = "Queued"
-BOT_STATUS_RESEARCHING = "Researching"
+# Bot_Status is an *outcome log*, not queue state. The queue lives in the
+# spreadsheet (see Worker.queue_column) and clears itself once the worker
+# fills the row. There is deliberately no "Researching" value: it cost an
+# extra write per row and nothing ever read it.
 BOT_STATUS_NEEDS_REVIEW = "Needs Review"
 BOT_STATUS_ERROR = "Error"
 
-# Bot_Status values that mark a row as already handled; excluded from the
-# queue unless --requeue is passed.
-TERMINAL_BOT_STATUSES: set[str] = {BOT_STATUS_NEEDS_REVIEW, BOT_STATUS_ERROR}
+# Written into any worker-owned cell the sheet's queue formula scans
+# (Worker.sentinel_columns) when the LLM found nothing. COUNTBLANK cannot
+# tell "never researched" from "researched, doesn't exist" — without this,
+# a firm with no public phone re-queues on every run, forever, at cost.
+SENTINEL_VALUE = "None"
+
+
+def is_effectively_blank(value: str | None) -> bool:
+    """True for a cell that holds no researched information — empty, or
+    the sentinel we wrote to mark 'researched, doesn't exist'. Use this
+    whenever reading a cell as *input* (e.g. the Website hint), so a
+    sentinel is never fed back to the LLM as if it were real data."""
+    if value is None:
+        return True
+    stripped = value.strip()
+    return stripped == "" or stripped == SENTINEL_VALUE
 
 
 def format_value(value: Any) -> str:
@@ -70,31 +76,56 @@ class Worker(ABC):
     # ground-truth business data a human might also fill in by hand. These
     # are overwritten every time a row is processed, regardless of
     # --force-refresh. Everything else in column_map is written only to a
-    # blank cell unless --force-refresh is passed. Ignored by workers that
-    # override compute_business_updates().
+    # blank cell unless --force-refresh is passed.
     always_overwrite_fields: frozenset[str] = frozenset()
 
-    # Columns a human owns on this worker's sheet/tab — the worker must
-    # never write to them, under any flag. Always includes "Status" at
-    # minimum; varies by sheet (see each worker's ground-truth columns).
+    # Columns a human owns on this worker's sheet/tab — never written,
+    # under any flag.
     human_owned_columns: list[str]
+
+    # Columns holding spreadsheet formulas — never written, under any flag.
+    # Writing one would replace the formula with a literal and break the
+    # queue permanently.
+    formula_columns: list[str] = []
+
+    # Worker-owned columns the sheet's queue formula scans for blanks. Every
+    # one is guaranteed non-blank after a row is processed — real value or
+    # SENTINEL_VALUE. Empty means the worker's tab has no such formula.
+    sentinel_columns: frozenset[str] = frozenset()
+
+    # The header holding the queue decision, and the values meaning "process
+    # this row" (compared trimmed + case-insensitively). None means this
+    # tab has no queue formula, and the runner falls back to scanning for
+    # blank business columns.
+    queue_column: str | None = None
+    queue_work_values: frozenset[str] = frozenset()
+
+    # Where the runner stamps the processing date. On a tab whose queue
+    # formula reads this column it MUST already exist (list it in
+    # extra_required_columns) — auto-creating a second one would leave the
+    # formula's cell forever blank and re-queue every row.
+    timestamp_column: str = "Last Checked"
+
+    # Headers that must already exist in the sheet; never auto-created.
+    extra_required_columns: list[str] = []
 
     # The header the runner writes this worker's route() output into
     # (VC: "Recommended_Channel"; grants: "Recommended_Action").
     route_column: str
 
-    # Worker-specific new columns beyond CORE_COLUMNS + route_column that
-    # must be auto-created if missing.
+    # Worker-specific bot-owned columns beyond CORE_COLUMNS + route_column,
+    # auto-created if missing.
     extra_columns: list[str] = []
 
     def __init__(self) -> None:
-        reserved = set(RUNNER_DIRECT_COLUMNS) | {self.route_column}
+        never_write = set(self.human_owned_columns) | set(self.formula_columns)
+        reserved = {"Bot_Status", self.timestamp_column, self.route_column}
 
-        overlap = set(self.column_map.values()) & set(self.human_owned_columns)
+        overlap = set(self.column_map.values()) & never_write
         if overlap:
             raise ValueError(
-                f"{self.name}: column_map may never target human-owned "
-                f"columns: {sorted(overlap)}"
+                f"{self.name}: column_map may never target human-owned or "
+                f"formula columns: {sorted(overlap)}"
             )
         overlap = set(self.column_map.values()) & reserved
         if overlap:
@@ -102,15 +133,55 @@ class Worker(ABC):
                 f"{self.name}: column_map may never target runner-managed "
                 f"columns: {sorted(overlap)}"
             )
+        overlap = set(self.sentinel_columns) - set(self.column_map.values())
+        if overlap:
+            raise ValueError(
+                f"{self.name}: sentinel_columns must all be column_map "
+                f"targets, but these are not: {sorted(overlap)}"
+            )
 
     @property
     def owned_columns(self) -> list[str]:
-        """All columns this worker's rows own: created via ensure_columns()
-        if missing, never required to pre-exist."""
+        """Bot-owned columns: auto-created (appended right of all existing
+        data) if missing. Never includes a column listed as required."""
+        required = set(self.extra_required_columns)
         seen: dict[str, None] = {}
-        for header in [*CORE_COLUMNS, self.route_column, *self.extra_columns]:
-            seen.setdefault(header, None)
+        for header in [
+            *CORE_COLUMNS,
+            self.route_column,
+            self.timestamp_column,
+            *self.extra_columns,
+        ]:
+            if header not in required:
+                seen.setdefault(header, None)
         return list(seen)
+
+    @property
+    def required_columns(self) -> list[str]:
+        """Headers that must already exist. Business columns a worker writes
+        into are real sheet columns, not something it invents for itself."""
+        owned = set(self.owned_columns)
+        seen: dict[str, None] = {}
+        for header in [
+            *self.input_columns,
+            *self.extra_required_columns,
+            *(h for h in self.column_map.values() if h not in owned),
+        ]:
+            seen.setdefault(header, None)
+        if self.queue_column:
+            seen.setdefault(self.queue_column, None)
+        return list(seen)
+
+    def configure(self, settings: Any) -> None:
+        """Apply env-driven overrides (e.g. a renamed queue column) before
+        the run starts. Default: nothing to configure."""
+
+    def wants_row(self, row: dict[str, str]) -> bool:
+        """Does the sheet's queue column say to process this row?"""
+        if not self.queue_column:
+            return True
+        value = (row.get(self.queue_column) or "").strip().casefold()
+        return value in {v.strip().casefold() for v in self.queue_work_values}
 
     @abstractmethod
     def build_prompt(self, row: dict[str, str], settings: Any) -> str:
@@ -122,21 +193,46 @@ class Worker(ABC):
         """Deterministic routing/action recommendation from a validated
         result, written into `route_column`. Must not perform I/O."""
 
+    def page_hint(self, row: dict[str, str]) -> str | None:
+        """A URL already known for this row, worth fetching directly before
+        paying for web search. None disables the cheap path."""
+        return None
+
+    def is_extraction_sufficient(self, result: BaseModel) -> bool:
+        """Did the cheap fetch-then-extract path find enough to skip web
+        search? Default: no, always fall back."""
+        return False
+
     def compute_business_updates(
         self, result: BaseModel, row: dict[str, str], force_refresh: bool
     ) -> dict[str, str]:
-        """Map a validated result onto sheet headers, respecting the
-        blank-cell-only-unless-force-refresh rule. Default: a straight walk
-        over column_map. Override for composite/joined columns."""
+        """Map a validated result onto sheet headers.
+
+        Two rules interact here:
+        - Never overwrite a non-empty cell unless --force-refresh. A cell
+          holding the sentinel counts as filled.
+        - Every sentinel column ends up non-blank, so the sheet's queue
+          formula stops reporting this row as unresearched.
+        """
         updates: dict[str, str] = {}
         for field_name, header in self.column_map.items():
             value = getattr(result, field_name)
-            if value is None:
+            is_sentinel_column = header in self.sentinel_columns
+            currently_blank = not (row.get(header) or "").strip()
+
+            if not (
+                field_name in self.always_overwrite_fields
+                or currently_blank
+                or force_refresh
+            ):
                 continue
-            always_overwrite = field_name in self.always_overwrite_fields
-            currently_blank = not row.get(header)
-            if always_overwrite or currently_blank or force_refresh:
-                updates[header] = format_value(value)
+
+            if value is None or (isinstance(value, str) and not value.strip()):
+                if is_sentinel_column:
+                    updates[header] = SENTINEL_VALUE
+                continue
+
+            updates[header] = format_value(value)
         return updates
 
     def after_research(

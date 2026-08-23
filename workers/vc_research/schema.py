@@ -1,8 +1,9 @@
 """Strict JSON contract the vc_research LLM call must satisfy.
 
-Field names and shapes follow the VC Research Worker build spec, Section 5,
-exactly. Every field the prompt asks for is represented here — nothing
-more, nothing less.
+Mirrors the Investors tab's worker-writable columns (D–O) plus the
+worker's own assessment fields. Personal contact names are deliberately
+absent: the sheet no longer has First/Last columns, and firm-level data
+is all that gets published downstream.
 """
 
 from __future__ import annotations
@@ -21,8 +22,9 @@ class VCResearchResult(BaseModel):
     state_or_country: str | None = None
     deadline: str | None = None
     application_link: str | None = None
-    contact_first_name: str | None = None
-    contact_last_name: str | None = None
+    linkedin_url: str | None = None
+    twitter_url: str | None = None
+    newsletter: str | None = None
     has_contact_form: bool
     draft_subject: str
     draft_body: str

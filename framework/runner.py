@@ -20,9 +20,6 @@ from framework.validation import (
 from framework.worker_base import (
     BOT_STATUS_ERROR,
     BOT_STATUS_NEEDS_REVIEW,
-    BOT_STATUS_QUEUED_EXPLICIT,
-    BOT_STATUS_RESEARCHING,
-    TERMINAL_BOT_STATUSES,
     Worker,
 )
 from sheets.client import ROW_NUMBER_KEY
@@ -44,7 +41,6 @@ class RunnerOptions:
 @dataclass
 class RunSummary:
     processed: int = 0
-    needs_review: int = 0
     errors: int = 0
     skipped: int = 0
     queue_size: int = 0
@@ -54,24 +50,29 @@ class RunSummary:
 def select_queue(
     rows: list[dict[str, str]], worker: Worker, options: RunnerOptions
 ) -> list[dict[str, str]]:
-    allowed_statuses = {"", BOT_STATUS_QUEUED_EXPLICIT}
-    if options.requeue:
-        allowed_statuses |= TERMINAL_BOT_STATUSES
+    """Read the queue decision; don't recompute it.
 
-    business_headers = [
-        header
-        for field_name, header in worker.column_map.items()
-        if field_name not in worker.always_overwrite_fields
-    ]
-
-    queue = []
+    On a tab with a queue formula (Investors' column Q), the spreadsheet
+    owns the decision: it reports a row as needing work until the worker
+    fills the scanned columns and stamps the timestamp, then the row leaves
+    the queue on its own. Rows that previously errored are held back so a
+    hard failure doesn't burn budget every run.
+    """
+    queue: list[dict[str, str]] = []
     for row in rows:
-        status = row.get("Bot_Status", "")
-        if status not in allowed_statuses:
+        if row.get("Bot_Status") == BOT_STATUS_ERROR and not options.requeue:
             continue
-        if not options.force_refresh:
-            has_blank = any(not row.get(header) for header in business_headers)
-            if not has_blank:
+        if not options.force_refresh and not worker.wants_row(row):
+            continue
+        if worker.queue_column is None and not options.force_refresh:
+            # No queue formula on this tab (grants): fall back to scanning
+            # for a business column the worker could still fill.
+            business_headers = [
+                header
+                for field_name, header in worker.column_map.items()
+                if field_name not in worker.always_overwrite_fields
+            ]
+            if not any(not row.get(header) for header in business_headers):
                 continue
         queue.append(row)
     return queue
@@ -88,44 +89,95 @@ def _build_success_updates(
     updates = worker.compute_business_updates(result, row, options.force_refresh)
 
     confidence = getattr(result, "confidence")
-    notes = updates.get("Research_Notes", "") or ""
     if confidence < settings.confidence_min:
-        bot_status = BOT_STATUS_NEEDS_REVIEW
+        notes = updates.get("Research_Notes", "") or ""
         low_conf_flag = f"[LOW CONFIDENCE: {confidence:.2f}] "
         if not notes.startswith(low_conf_flag):
-            notes = low_conf_flag + notes
-        updates["Research_Notes"] = notes
-    else:
-        bot_status = BOT_STATUS_NEEDS_REVIEW
+            updates["Research_Notes"] = low_conf_flag + notes
 
     route_value = worker.route(result)
 
     updates[worker.route_column] = route_value
-    updates["Bot_Status"] = bot_status
-    updates["Last_Checked"] = today
+    updates["Bot_Status"] = BOT_STATUS_NEEDS_REVIEW
+    updates[worker.timestamp_column] = today
 
-    extra = worker.after_research(row, result, route_value, settings)
-    updates.update(extra)
+    updates.update(worker.after_research(row, result, route_value, settings))
 
-    return updates, bot_status
+    return updates, BOT_STATUS_NEEDS_REVIEW
 
 
-def _assert_no_human_owned_writes(updates: dict[str, str], worker: Worker) -> None:
-    violations = set(updates) & set(worker.human_owned_columns)
+def _assert_writable(updates: dict[str, str], worker: Worker) -> None:
+    violations = set(updates) & (
+        set(worker.human_owned_columns) | set(worker.formula_columns)
+    )
     if violations:
-        raise AssertionError(f"Refusing to write human-owned columns: {violations}")
+        raise AssertionError(
+            f"Refusing to write human-owned or formula columns: {sorted(violations)}"
+        )
 
 
 def _write(
     sheets_client: Any, worker: Worker, row_number: int, updates: dict[str, str], dry_run: bool
 ) -> None:
-    _assert_no_human_owned_writes(updates, worker)
+    _assert_writable(updates, worker)
     if not updates:
         return
     if dry_run:
         log_event(logger, "dry_run_write", row=row_number, updates=updates)
         return
     sheets_client.write_cells(row_number, updates)
+
+
+def _assert_sentinels_filled(updates: dict[str, str], row: dict[str, str], worker: Worker) -> None:
+    """Every scanned column must be non-blank once a row is processed, or
+    the queue formula reports it as unresearched forever."""
+    unfilled = [
+        header
+        for header in worker.sentinel_columns
+        if not (updates.get(header) or row.get(header) or "").strip()
+    ]
+    if unfilled:
+        raise AssertionError(
+            f"Sentinel columns left blank (row would re-queue forever): {sorted(unfilled)}"
+        )
+
+
+def _try_cheap_extract(
+    row: dict[str, str],
+    worker: Worker,
+    llm_client: Any,
+    settings: Any,
+    prompt: str,
+) -> BaseModel | None:
+    """Fetch the row's own website and extract from that text instead of
+    paying for web search. Returns None whenever the cheap path isn't
+    applicable or didn't yield enough, so the caller falls back."""
+    if not getattr(settings, "fetch_first", False):
+        return None
+    url = worker.page_hint(row)
+    if not url:
+        return None
+
+    from llm.fetch import fetch_page_text
+
+    page_text = fetch_page_text(
+        url,
+        timeout=getattr(settings, "fetch_timeout_seconds", 15.0),
+        max_chars=getattr(settings, "fetch_max_chars", 20_000),
+    )
+    if not page_text:
+        return None
+
+    try:
+        result = parse_and_validate(llm_client.extract(prompt, page_text), worker.output_schema)
+    except SchemaValidationError as exc:
+        log_event(logger, "cheap_extract_invalid", url=url, reason=str(exc)[:200], level="WARNING")
+        return None
+
+    if not worker.is_extraction_sufficient(result):
+        log_event(logger, "cheap_extract_thin", url=url)
+        return None
+    return result
 
 
 def _process_row(
@@ -139,24 +191,18 @@ def _process_row(
 ) -> str:
     row_number = row[ROW_NUMBER_KEY]
 
-    _write(
-        sheets_client,
-        worker,
-        row_number,
-        {"Bot_Status": BOT_STATUS_RESEARCHING, "Last_Checked": today},
-        options.dry_run,
-    )
-
     prompt = worker.build_prompt(row, settings)
     errors: list[str] = []
-    result: BaseModel | None = None
+
+    result = _try_cheap_extract(row, worker, llm_client, settings, prompt)
 
     current_prompt = prompt
-    for attempt in range(1, _MAX_ATTEMPTS + 1):
+    for _attempt in range(_MAX_ATTEMPTS):
+        if result is not None:
+            break
         raw = llm_client.research(current_prompt)
         try:
             result = parse_and_validate(raw, worker.output_schema)
-            break
         except SchemaValidationError as exc:
             errors.append(str(exc))
             current_prompt = build_retry_prompt(prompt, exc)
@@ -169,7 +215,7 @@ def _process_row(
             row_number,
             {
                 "Bot_Status": BOT_STATUS_ERROR,
-                "Last_Checked": today,
+                worker.timestamp_column: today,
                 "Research_Notes": reason,
             },
             options.dry_run,
@@ -178,9 +224,31 @@ def _process_row(
         return BOT_STATUS_ERROR
 
     updates, bot_status = _build_success_updates(row, result, worker, settings, options, today)
+    _assert_sentinels_filled(updates, row, worker)
     _write(sheets_client, worker, row_number, updates, options.dry_run)
     log_event(logger, "row_processed", row=row_number, bot_status=bot_status)
     return bot_status
+
+
+def assert_no_owned_column_in_scanned_range(
+    sheets_client: Any, worker: Worker, first: int, last: int
+) -> None:
+    """Bot-owned columns must never land inside the range the sheet's queue
+    formula scans (Investors: D:O). A column inserted there silently changes
+    which rows the formula considers unresearched."""
+    if not worker.sentinel_columns:
+        return
+    intruders = [
+        header
+        for header in worker.owned_columns
+        if sheets_client.has_column(header)
+        and first <= sheets_client.column_index(header) <= last
+    ]
+    if intruders:
+        raise AssertionError(
+            f"Bot-owned column(s) inside the formula-scanned range "
+            f"(columns {first}-{last}): {sorted(intruders)}"
+        )
 
 
 def run(
@@ -190,10 +258,9 @@ def run(
     settings: Any,
     options: RunnerOptions,
 ) -> RunSummary:
-    owned = set(worker.owned_columns)
+    sheets_client.require_columns(worker.required_columns)
     sheets_client.ensure_columns(worker.owned_columns)
-    sheets_client.require_columns(worker.input_columns)
-    sheets_client.require_columns([h for h in worker.column_map.values() if h not in owned])
+    assert_no_owned_column_in_scanned_range(sheets_client, worker, first=4, last=15)
 
     rows = sheets_client.read_all_rows()
     queue = select_queue(rows, worker, options)
@@ -209,13 +276,12 @@ def run(
             summary.errors += 1
         else:
             summary.processed += 1
-            summary.needs_review += 1
 
     log_event(
         logger,
         "run_summary",
+        worker=worker.name,
         processed=summary.processed,
-        needs_review=summary.needs_review,
         errors=summary.errors,
         skipped=summary.skipped,
         queue_size=summary.queue_size,

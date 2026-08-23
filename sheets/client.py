@@ -95,6 +95,10 @@ class SheetsClient:
     def has_column(self, header: str) -> bool:
         return header in self._header_to_col
 
+    def column_index(self, header: str) -> int:
+        """1-based column index for a header. Raises KeyError if absent."""
+        return self._header_to_col[header]
+
     def require_columns(self, headers: list[str]) -> None:
         """Raise MissingColumnError if any of these headers isn't present.
         Used for business columns a worker's column_map targets — those
@@ -105,27 +109,33 @@ class SheetsClient:
             raise MissingColumnError(f"Missing expected column(s): {missing}")
 
     def ensure_columns(self, required_headers: list[str]) -> None:
-        """Create any header in required_headers that's missing, writing
-        only the header cell. Reuses the first blank header slot found
-        after the existing headers before appending past the end (the real
-        sheet has trailing blank columns). Idempotent."""
+        """Create any missing header, writing only the header cell.
+
+        New columns are always appended to the right of every column that
+        holds data anywhere in the sheet — never dropped into a blank slot
+        in the middle. The Investors tab's queue formula scans a fixed
+        range (D:O) and has a notes column with no header, so reusing an
+        interior blank would silently change queue semantics or clobber
+        human notes. Idempotent.
+        """
         missing = [h for h in required_headers if h not in self._header_to_col]
         if not missing:
             return
 
-        # Find blank slots within the current header row first.
-        blank_slots = [idx + 1 for idx, h in enumerate(self._headers) if not h]
-        next_col = len(self._headers) + 1
-
+        next_col = self._used_width() + 1
         for header in missing:
-            if blank_slots:
-                col = blank_slots.pop(0)
-            else:
-                col = next_col
-                next_col += 1
-            self._ws.update_cell(self._header_row, col, header)
+            self._ws.update_cell(self._header_row, next_col, header)
+            next_col += 1
 
         self._refresh_headers()
+
+    def _used_width(self) -> int:
+        """Widest row in the sheet, in columns. A column can hold data
+        under a blank header (the Investors tab keeps freeform notes that
+        way), so the header row alone understates the used range."""
+        widths = [len(self._headers)]
+        widths.extend(len(row) for row in self._ws.get_all_values())
+        return max(widths, default=0)
 
     # -- reads ---------------------------------------------------------
 

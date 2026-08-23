@@ -6,6 +6,9 @@ from workers.vc_research.worker import (
     CHANNEL_CONTACT_BOX,
     CHANNEL_EMAIL,
     CHANNEL_LINKEDIN,
+    CHANNEL_MANUAL_REVIEW,
+    CHANNEL_RESEARCH_FAILED,
+    CHANNEL_TWITTER,
     VCResearchWorker,
 )
 
@@ -13,11 +16,14 @@ from workers.vc_research.worker import (
 def _result(**overrides) -> VCResearchResult:
     base = dict(
         investor_name="Acme Ventures",
-        website="https://acme.vc",
+        website=None,
+        industry_focus=None,
+        stage=None,
         application_link=None,
         email=None,
-        contact_first_name=None,
-        contact_last_name=None,
+        linkedin_url=None,
+        twitter_url=None,
+        newsletter=None,
         has_contact_form=False,
         draft_subject="Hi",
         draft_body="Hello",
@@ -28,39 +34,47 @@ def _result(**overrides) -> VCResearchResult:
     return VCResearchResult(**base)
 
 
-def test_application_link_wins_even_with_email_and_contact_form():
+def test_application_link_outranks_every_other_channel():
     worker = VCResearchWorker()
     result = _result(
         application_link="https://apply.acme.vc",
         email="partner@acme.vc",
-        contact_first_name="Jane",
         has_contact_form=True,
+        linkedin_url="https://linkedin.com/company/acme",
+        twitter_url="https://x.com/acme",
     )
     assert worker.route(result) == CHANNEL_APPLY
 
 
-def test_named_partner_with_email_routes_to_email():
+def test_any_usable_email_routes_to_email():
+    # The sheet no longer carries partner names, so a firm-level address
+    # is enough — the old "named partner required" rule is gone.
     worker = VCResearchWorker()
-    result = _result(email="jane@acme.vc", contact_first_name="Jane")
-    assert worker.route(result) == CHANNEL_EMAIL
+    assert worker.route(_result(email="info@acme.vc")) == CHANNEL_EMAIL
 
 
-def test_contact_form_without_usable_email_routes_to_contact_box():
+def test_contact_form_without_email_routes_to_contact_box():
     worker = VCResearchWorker()
-    result = _result(has_contact_form=True, email=None)
-    assert worker.route(result) == CHANNEL_CONTACT_BOX
+    assert worker.route(_result(has_contact_form=True)) == CHANNEL_CONTACT_BOX
 
 
-def test_no_signals_falls_back_to_linkedin():
+def test_linkedin_is_used_when_no_direct_channel_exists():
     worker = VCResearchWorker()
-    result = _result()
+    result = _result(linkedin_url="https://linkedin.com/company/acme")
     assert worker.route(result) == CHANNEL_LINKEDIN
 
 
-def test_email_without_partner_name_falls_back_to_linkedin():
-    # Email alone (no named partner) doesn't satisfy the "named partner +
-    # official email" rule, and an existing email makes it not a usable
-    # Contact Box case either.
+def test_twitter_is_the_last_outreach_channel():
     worker = VCResearchWorker()
-    result = _result(email="info@acme.vc", contact_first_name=None)
-    assert worker.route(result) == CHANNEL_LINKEDIN
+    assert worker.route(_result(twitter_url="https://x.com/acme")) == CHANNEL_TWITTER
+
+
+def test_partial_data_without_a_channel_routes_to_manual_review():
+    worker = VCResearchWorker()
+    result = _result(website="https://acme.vc", industry_focus="Climate")
+    assert worker.route(result) == CHANNEL_MANUAL_REVIEW
+
+
+def test_nothing_usable_routes_to_research_failed():
+    worker = VCResearchWorker()
+    assert worker.route(_result()) == CHANNEL_RESEARCH_FAILED

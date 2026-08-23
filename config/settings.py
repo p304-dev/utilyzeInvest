@@ -28,17 +28,33 @@ class Settings(BaseSettings):
 
     # --- Google Sheets ---
     google_application_credentials: str = "./service-account.json"
-    google_project_id: str = ""
     sheet_id: str = ""
-    sheet_tab: str = "Investors"
 
     # --- Runner behavior ---
-    batch_size: int = 5
-    confidence_min: float = Field(default=0.5, ge=0.0, le=1.0)
+    # Sized for the ~968-row backfill: ~4 biweekly runs clears it, and a
+    # run stays well inside the 6-hour GitHub Actions job limit. Steady
+    # state after that is a handful of rows per run.
+    batch_size: int = 250
+    confidence_min: float = Field(default=0.65, ge=0.0, le=1.0)
+
+    # The header holding the sheet's queue formula. Overridable so renaming
+    # the column in the sheet doesn't require a code change.
+    queue_column: str = "Deadline Formula"
+
+    # Fetch a row's known website and extract from that page before falling
+    # back to a web-search-enabled call. Much cheaper per row.
+    fetch_first: bool = True
+    fetch_timeout_seconds: float = 15.0
+    fetch_max_chars: int = 20_000
 
     # --- Gmail ---
     gmail_enabled: bool = False
     gmail_sender: str = "ana.valentino@utilyze.ai"
+
+    # --- Wix CMS publish (--publish only; never part of a research run) ---
+    wix_api_key: str = ""
+    wix_site_id: str = ""
+    wix_collection_id: str = ""
 
     # --- Prompt company context ---
     utilyze_context_file: str = "config/utilyze_context.md"
