@@ -1,16 +1,22 @@
 """Publishing is the one step that makes sheet data public, so the field
-allowlist and the no-duplicates guarantee are tested directly.
+allowlist, the deadline normalization, and the no-duplicates guarantee are
+tested directly.
 """
 
 from __future__ import annotations
 
+from datetime import date
+
 import pytest
 
+from framework.worker_base import SENTINEL_VALUE
 from tests.fixtures.investors_sheet import investors_row
-from wix.client import WixClient, WixError
+from wix.client import BulkItemResult, WixClient, WixError
+from wix.deadline import compute_deadline_fields
 from wix.publish import (
+    ALLOWED_WIX_KEYS,
     FORBIDDEN_FIELDS,
-    PUBLISH_FIELDS,
+    SOURCE_FIELDS,
     PublishAllowlistError,
     build_item,
     publish_rows,
@@ -20,16 +26,21 @@ from wix.publish import (
 
 
 class FakeWixClient:
-    def __init__(self) -> None:
-        self.saved: dict[str, dict[str, str]] = {}
-        self.calls: list[str] = []
+    def __init__(self, *, fail: bool = False) -> None:
+        self.saved: dict[str, dict[str, object]] = {}
+        self.calls: list[list[str]] = []
+        self._fail = fail
 
-    def save_item(self, item_id: str, data: dict[str, str]) -> dict[str, object]:
-        self.calls.append(item_id)
-        # Mirrors Save Data Item's upsert-on-id behavior.
-        action = "UPDATED" if item_id in self.saved else "INSERTED"
-        self.saved[item_id] = data
-        return {"action": action, "dataItem": {"id": item_id, "data": data}}
+    def save_items(self, items: dict[str, dict[str, object]]) -> list[BulkItemResult]:
+        ids = list(items)
+        self.calls.append(ids)
+        if self._fail:
+            raise WixError("simulated outage")
+        results = []
+        for item_id, data in items.items():
+            self.saved[item_id] = data
+            results.append(BulkItemResult(item_id=item_id, success=True))
+        return results
 
 
 def _researched_row(**overrides) -> dict[str, str]:
@@ -43,6 +54,7 @@ def _researched_row(**overrides) -> dict[str, str]:
             "Phone": "+1-555-0100",
             "City": "Austin",
             "State/Country": "Texas",
+            "Deadline": "2099-01-01",
             "Application Link": "https://acme.vc/apply",
             "Deadline Status": "Open",
             "Contact Date": "2026-01-05",
@@ -58,34 +70,94 @@ def _researched_row(**overrides) -> dict[str, str]:
 # -- the allowlist -------------------------------------------------------
 
 
-def test_allowlist_and_forbidden_sets_never_overlap():
-    assert not (set(PUBLISH_FIELDS) & FORBIDDEN_FIELDS)
+def test_source_and_forbidden_sets_never_overlap():
+    assert not (set(SOURCE_FIELDS) & FORBIDDEN_FIELDS)
+
+
+def test_email_and_phone_keys_are_not_on_the_output_allowlist():
+    assert "email" not in ALLOWED_WIX_KEYS
+    assert "phone" not in ALLOWED_WIX_KEYS
 
 
 def test_personal_and_outreach_fields_are_never_published():
     item = build_item(_researched_row())
-    for forbidden in ("Email", "Phone", "Contact Date", "Status", "Draft_Body", "Draft_Subject"):
-        assert forbidden not in item
+    for value in ("partner@acme.vc", "+1-555-0100", "2026-01-05", "Emailed", "Hi there", "Intro"):
+        assert value not in item.values()
 
 
-def test_only_allowlisted_fields_are_published():
+def test_only_allowlisted_keys_are_published():
     item = build_item(_researched_row())
-    assert set(item) <= set(PUBLISH_FIELDS)
-    assert item["Name"] == "Acme Ventures"
-    assert item["Industry Focus"] == "Climate"
+    assert set(item) <= ALLOWED_WIX_KEYS
+    assert item["name"] == "Acme Ventures"
+    assert item["industryFocus"] == "Climate"
+    assert item["stateCountry"] == "Texas"
 
 
-def test_build_item_rejects_a_disallowed_field(monkeypatch):
-    # If someone adds a contact field to the allowlist, the guard fires.
-    monkeypatch.setattr("wix.publish.PUBLISH_FIELDS", (*PUBLISH_FIELDS, "Email"))
-    with pytest.raises(PublishAllowlistError, match="Email"):
+def test_build_item_rejects_a_key_not_on_the_allowlist(monkeypatch):
+    # If a future edit adds a field build_item emits without also adding it
+    # to ALLOWED_WIX_KEYS, the guard must fire rather than silently publish it.
+    monkeypatch.setattr("wix.publish.ALLOWED_WIX_KEYS", frozenset({"website"}))
+    with pytest.raises(PublishAllowlistError, match="name"):
         build_item(_researched_row())
 
 
-def test_sentinels_are_not_published_as_literal_none():
-    item = build_item(_researched_row(**{"Application Link": "None", "City": ""}))
-    assert "Application Link" not in item
-    assert "City" not in item
+def test_sentinels_and_blanks_are_not_published_as_a_literal_value():
+    item = build_item(_researched_row(**{"Application Link": SENTINEL_VALUE, "City": ""}))
+    assert "applicationLink" not in item
+    assert "city" not in item
+    assert item["location"] == "Texas"  # falls back to just the region
+
+
+# -- deadline normalization -----------------------------------------------
+
+
+def test_rolling_text_is_recognized_regardless_of_case():
+    fields = compute_deadline_fields("rolling", None)
+    assert fields.is_rolling is True
+    assert fields.status == "ROLLING"
+    assert fields.label == "Rolling"
+    assert fields.sort_iso == "2099-12-31"
+    assert fields.days_left is None
+
+
+def test_deadline_status_column_can_signal_rolling_on_its_own():
+    fields = compute_deadline_fields("N/A", "ROLLING")
+    assert fields.is_rolling is True
+
+
+def test_future_date_is_open_or_closing_soon():
+    today = date(2026, 1, 1)
+    far = compute_deadline_fields("2026-06-01", "Open", today=today)
+    assert far.status == "OPEN"
+    assert far.date_iso == "2026-06-01"
+    assert far.days_left == 151
+
+    soon = compute_deadline_fields("2026-01-10", "Open", today=today)
+    assert soon.status == "CLOSING SOON"
+    assert soon.days_left == 9
+
+
+def test_past_date_is_marked_passed_and_sorts_to_the_far_past():
+    today = date(2026, 1, 1)
+    fields = compute_deadline_fields("2025-01-01", "Open", today=today)
+    assert fields.status == "PASSED"
+    assert fields.sort_iso == "1900-01-01"
+
+
+def test_blank_deadline_is_unknown_not_an_error():
+    fields = compute_deadline_fields("", "")
+    assert fields.status == "UNKNOWN"
+    assert fields.label == "—"
+    assert fields.date_iso is None
+    assert fields.sort_iso == "2099-12-31"
+
+
+def test_build_item_exposes_all_deadline_fields():
+    item = build_item(_researched_row(Deadline="Rolling", **{"Deadline Status": "Rolling"}))
+    assert item["isRolling"] is True
+    assert item["deadlineStatus"] == "ROLLING"
+    assert item["deadlineLabel"] == "Rolling"
+    assert item["deadlineSort"] == "2099-12-31"
 
 
 # -- row selection -------------------------------------------------------
@@ -123,8 +195,17 @@ def test_publishing_twice_creates_no_duplicates():
 
     assert first.published == 1
     assert second.published == 1
-    assert client.calls == ["acme-ventures", "acme-ventures"]
+    assert client.calls == [["acme-ventures"], ["acme-ventures"]]
     assert len(client.saved) == 1
+
+
+def test_publish_uses_one_bulk_call_for_many_rows():
+    rows = [_researched_row(Name=f"Firm {i}") for i in range(5)]
+    client = FakeWixClient()
+    summary = publish_rows(rows, client, queue_column="Deadline Formula")
+    assert summary.published == 5
+    assert len(client.calls) == 1
+    assert len(client.calls[0]) == 5
 
 
 def test_dry_run_publishes_nothing():
@@ -134,6 +215,13 @@ def test_dry_run_publishes_nothing():
     )
     assert summary.published == 1
     assert client.calls == []
+
+
+def test_a_failed_bulk_call_is_reported_as_errors_not_raised():
+    client = FakeWixClient(fail=True)
+    summary = publish_rows([_researched_row()], client, queue_column="Deadline Formula")
+    assert summary.errors == 1
+    assert summary.published == 0
 
 
 # -- client construction -------------------------------------------------

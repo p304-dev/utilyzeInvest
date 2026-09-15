@@ -13,10 +13,11 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from framework.worker_base import Worker, is_effectively_blank
-from workers.vc_research.schema import VCResearchResult
+from framework.worker_base import SENTINEL_VALUE, Worker, format_value, is_effectively_blank
+from workers.vc_research.schema import VCRecheckResult, VCResearchResult
 
 _PROMPT_PATH = Path(__file__).parent / "prompt.md"
+_RECHECK_PROMPT_PATH = Path(__file__).parent / "recheck_prompt.md"
 
 CHANNEL_APPLY = "Apply"
 CHANNEL_EMAIL = "Email"
@@ -62,6 +63,7 @@ class VCResearchWorker(Worker):
         "website": "Website",
         "industry_focus": "Industry Focus",
         "stage": "Stage",
+        "category": "Category",
         "email": "Email",
         "phone": "Phone",
         "city": "City",
@@ -74,19 +76,15 @@ class VCResearchWorker(Worker):
         "confidence": "Confidence",
         "source_urls": "Source_URLs",
         "notes": "Research_Notes",
-        "draft_subject": "Draft_Subject",
-        "draft_body": "Draft_Body",
     }
 
     # These reflect the worker's own assessment, not ground-truth business
     # data, so they're refreshed on every processed row.
-    always_overwrite_fields = frozenset(
-        {"confidence", "source_urls", "notes", "draft_subject", "draft_body"}
-    )
+    always_overwrite_fields = frozenset({"confidence", "source_urls", "notes"})
 
     sentinel_columns = _SCANNED_COLUMNS
 
-    human_owned_columns = ["Status", "Contact Date", "Category"]
+    human_owned_columns = ["Status", "Contact Date"]
     formula_columns = ["Deadline Formula", "Deadline Status"]
 
     queue_column = "Deadline Formula"
@@ -99,7 +97,12 @@ class VCResearchWorker(Worker):
     extra_required_columns = ["Last Checked", "Deadline Formula", "Deadline Status"]
 
     route_column = "Recommended_Channel"
-    extra_columns = ["Draft_Subject", "Draft_Body", "Draft_Status", "Draft_Link"]
+
+    # A STALE row (already researched, just due a 90-day refresh) only
+    # re-verifies deadline/application-link accuracy — see recheck_prompt.md
+    # and compute_recheck_updates() below. A brand-new row (PULL VC DATA)
+    # always gets the full research path regardless of this.
+    recheck_schema = VCRecheckResult
 
     def configure(self, settings: Any) -> None:
         """Let a queue-header rename be a config change, not a code change."""
@@ -115,9 +118,60 @@ class VCResearchWorker(Worker):
         if is_effectively_blank(website):
             website = ""
         return (
-            template.replace("{{UTILYZE_CONTEXT}}", settings.utilyze_context)
-            .replace("{{Name}}", row.get("Name", ""))
+            template.replace("{{Name}}", row.get("Name", ""))
             .replace("{{Website}}", website)
+            .replace("{{KNOWN_FIELDS}}", self._known_fields_block(row))
+        )
+
+    def _known_fields_block(self, row: dict[str, str]) -> str:
+        """Whatever a human (or an earlier pass) already put in this row,
+        so the model doesn't burn search effort re-deriving it. Website is
+        excluded — it's already surfaced separately above as an identity
+        hint, not as a field to skip researching.
+
+        A real value and the sentinel value both mean "don't research
+        this" — they just mean different things to echo back: a real value
+        gets copied as-is, while a sentinel means an earlier pass already
+        confirmed nothing exists, so the model should return null for it
+        rather than trying again.
+        """
+        known = []
+        confirmed_absent = []
+        for field_name, header in self.column_map.items():
+            if field_name in self.always_overwrite_fields or header == "Website":
+                continue
+            stripped = (row.get(header) or "").strip()
+            if not stripped:
+                continue  # truly blank — needs research
+            if stripped == SENTINEL_VALUE:
+                confirmed_absent.append(f"- {header}")
+            else:
+                known.append(f"- {header}: {stripped}")
+
+        if not known and not confirmed_absent:
+            return "(Nothing pre-filled for this row — research every field below.)"
+
+        sections = []
+        if known:
+            sections.append(
+                "Already confirmed — return these exact values unchanged, no need to "
+                "re-verify or source them:\n" + "\n".join(known)
+            )
+        if confirmed_absent:
+            sections.append(
+                "Already checked in an earlier pass and confirmed NOT publicly "
+                "available — return null for these, do not search for them again:\n"
+                + "\n".join(confirmed_absent)
+            )
+        return "\n\n".join(sections)
+
+    def build_recheck_prompt(self, row: dict[str, str], settings: Any) -> str:
+        template = _RECHECK_PROMPT_PATH.read_text(encoding="utf-8")
+        return (
+            template.replace("{{Name}}", row.get("Name", ""))
+            .replace("{{Website}}", row.get("Website", ""))
+            .replace("{{Deadline}}", row.get("Deadline", ""))
+            .replace("{{Application Link}}", row.get("Application Link", ""))
         )
 
     def page_hint(self, row: dict[str, str]) -> str | None:
@@ -130,8 +184,10 @@ class VCResearchWorker(Worker):
 
     def is_extraction_sufficient(self, result: BaseModel) -> bool:
         assert isinstance(result, VCResearchResult)
+        # industry_focus/category excluded: both always default to a real
+        # value (Generalist/Investor) rather than null, so neither is
+        # evidence the cheap extraction actually found anything.
         researched = [
-            result.industry_focus,
             result.stage,
             result.email,
             result.city,
@@ -155,11 +211,13 @@ class VCResearchWorker(Worker):
             return CHANNEL_LINKEDIN
         if result.twitter_url:
             return CHANNEL_TWITTER
+        # industry_focus/category are excluded: both always default to a
+        # real value (Generalist/Investor) rather than null, so neither is
+        # evidence anything was actually found.
         partial = any(
             value and value.strip()
             for value in (
                 result.website,
-                result.industry_focus,
                 result.stage,
                 result.city,
                 result.state_or_country,
@@ -167,27 +225,24 @@ class VCResearchWorker(Worker):
         )
         return CHANNEL_MANUAL_REVIEW if partial else CHANNEL_RESEARCH_FAILED
 
-    def after_research(
-        self,
-        row: dict[str, str],
-        result: BaseModel,
-        route_value: str,
-        settings: Any,
+    def compute_recheck_updates(
+        self, result: BaseModel, row: dict[str, str], force_refresh: bool
     ) -> dict[str, str]:
-        assert isinstance(result, VCResearchResult)
+        assert isinstance(result, VCRecheckResult)
+        updates: dict[str, str] = {}
 
-        if route_value == CHANNEL_EMAIL and result.email and settings.gmail_enabled:
-            from gmail.client import GmailClient
+        # Only overwrite when the recheck actually found a value. A null
+        # here means "couldn't confirm," not "confirmed absent" — unlike a
+        # first-pass research call, an inconclusive recheck must never
+        # blank out data a full research pass already verified.
+        if result.deadline and result.deadline.strip():
+            updates["Deadline"] = result.deadline.strip()
+        if result.application_link and result.application_link.strip():
+            updates["Application Link"] = result.application_link.strip()
 
-            gmail_client = GmailClient(
-                credentials_path=settings.google_application_credentials,
-                sender=settings.gmail_sender,
-            )
-            draft_link = gmail_client.create_draft(
-                to=result.email,
-                subject=result.draft_subject,
-                body=result.draft_body,
-            )
-            return {"Draft_Status": "Gmail Draft Created", "Draft_Link": draft_link}
+        updates["Confidence"] = format_value(result.confidence)
+        updates["Source_URLs"] = format_value(result.source_urls)
+        if result.notes:
+            updates["Research_Notes"] = f"[Recheck] {result.notes.strip()}"
 
-        return {"Draft_Status": "Drafted"}
+        return updates

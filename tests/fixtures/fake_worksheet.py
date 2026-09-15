@@ -6,14 +6,7 @@ calls or the real gspread object graph.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
-
-@dataclass
-class FakeCell:
-    row: int
-    col: int
-    value: str
+from typing import Any
 
 
 class FakeWorksheet:
@@ -39,11 +32,10 @@ class FakeWorksheet:
         self._ensure_size(row, col)
         self._rows[row - 1][col - 1] = value
 
-    def cell(self, row: int, col: int) -> FakeCell:
-        self._ensure_size(row, col)
-        return FakeCell(row=row, col=col, value=self._rows[row - 1][col - 1])
-
-    def update_cells(self, cell_list: list[FakeCell]) -> None:
+    def update_cells(self, cell_list: list[Any]) -> None:
+        # Accepts anything with .row/.col/.value — real code passes
+        # gspread.Cell objects here now that write_cells() builds them
+        # locally instead of fetching via worksheet.cell().
         for c in cell_list:
             self._ensure_size(c.row, c.col)
             self._rows[c.row - 1][c.col - 1] = c.value

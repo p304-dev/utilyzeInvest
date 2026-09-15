@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 import gspread
+from gspread import Cell
 from google.oauth2.service_account import Credentials
 
 _SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -25,7 +26,6 @@ class WorksheetLike(Protocol):
     def get_all_values(self) -> list[list[str]]: ...
     def update_cell(self, row: int, col: int, value: Any) -> None: ...
     def update_cells(self, cell_list: list[Any]) -> None: ...
-    def cell(self, row: int, col: int) -> Any: ...
 
 
 class MissingColumnError(Exception):
@@ -161,7 +161,15 @@ class SheetsClient:
         """updates: header -> value. Every header is resolved via the
         current header map (raises KeyError on an unknown header rather
         than guessing a position). Batches all cells for this row into a
-        single gspread update_cells call."""
+        single gspread update_cells call.
+
+        Cell objects are built locally (row/col/value only) rather than
+        fetched via worksheet.cell(), which issues a live read per cell.
+        We're about to overwrite the value anyway, so reading it first is
+        pure waste — and at N fields per row, it was enough read traffic
+        to blow through Sheets API's per-minute read quota on a run of
+        more than a few dozen rows.
+        """
         if not updates:
             return
 
@@ -170,8 +178,6 @@ class SheetsClient:
             if header not in self._header_to_col:
                 raise KeyError(f"Unknown column header: {header!r}")
             col = self._header_to_col[header]
-            cell = self._ws.cell(row_number, col)
-            cell.value = value
-            cells.append(cell)
+            cells.append(Cell(row_number, col, value))
 
         self._ws.update_cells(cells)

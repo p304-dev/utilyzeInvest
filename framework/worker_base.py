@@ -33,7 +33,9 @@ BOT_STATUS_ERROR = "Error"
 # (Worker.sentinel_columns) when the LLM found nothing. COUNTBLANK cannot
 # tell "never researched" from "researched, doesn't exist" — without this,
 # a firm with no public phone re-queues on every run, forever, at cost.
-SENTINEL_VALUE = "None"
+# An em-dash rather than a real blank: still non-blank to COUNTBLANK, but
+# reads as an ordinary "nothing here" marker instead of a stray "None".
+SENTINEL_VALUE = "—"
 
 
 def is_effectively_blank(value: str | None) -> bool:
@@ -117,6 +119,14 @@ class Worker(ABC):
     # auto-created if missing.
     extra_columns: list[str] = []
 
+    # Optional cheap-recheck path: when a row is re-queued because it went
+    # STALE (not because it's brand new), a full re-research of every field
+    # is wasteful — most of it hasn't changed. If recheck_schema is set,
+    # the runner uses build_recheck_prompt()/compute_recheck_updates()
+    # instead of the full research path for STALE rows. None (the default)
+    # means every row gets full research regardless of why it was queued.
+    recheck_schema: type[BaseModel] | None = None
+
     def __init__(self) -> None:
         never_write = set(self.human_owned_columns) | set(self.formula_columns)
         reserved = {"Bot_Status", self.timestamp_column, self.route_column}
@@ -183,6 +193,16 @@ class Worker(ABC):
         value = (row.get(self.queue_column) or "").strip().casefold()
         return value in {v.strip().casefold() for v in self.queue_work_values}
 
+    def wants_recheck(self, row: dict[str, str]) -> bool:
+        """Was this row queued because it went STALE (already researched,
+        just due for a refresh) rather than because it's brand new? Only
+        meaningful when recheck_schema is set — the runner checks that
+        separately, so this only needs to read the queue value itself."""
+        if self.recheck_schema is None or not self.queue_column:
+            return False
+        value = (row.get(self.queue_column) or "").strip().casefold()
+        return value == "stale"
+
     @abstractmethod
     def build_prompt(self, row: dict[str, str], settings: Any) -> str:
         """Render the worker's prompt template using this row's input
@@ -202,6 +222,20 @@ class Worker(ABC):
         """Did the cheap fetch-then-extract path find enough to skip web
         search? Default: no, always fall back."""
         return False
+
+    def build_recheck_prompt(self, row: dict[str, str], settings: Any) -> str:
+        """Only called when recheck_schema is set and the row is a STALE
+        recheck rather than a fresh row. No default — a worker that sets
+        recheck_schema must implement this."""
+        raise NotImplementedError(f"{self.name} sets recheck_schema but has no build_recheck_prompt")
+
+    def compute_recheck_updates(
+        self, result: BaseModel, row: dict[str, str], force_refresh: bool
+    ) -> dict[str, str]:
+        """Map a recheck result onto sheet headers. Only called when
+        recheck_schema is set. No default — a worker that sets
+        recheck_schema must implement this."""
+        raise NotImplementedError(f"{self.name} sets recheck_schema but has no compute_recheck_updates")
 
     def compute_business_updates(
         self, result: BaseModel, row: dict[str, str], force_refresh: bool
@@ -242,9 +276,8 @@ class Worker(ABC):
         route_value: str,
         settings: Any,
     ) -> dict[str, str]:
-        """Optional hook for worker-specific side effects (e.g. VC's Gmail
-        draft creation) run after the standard columns are computed.
-        Returns extra header -> value writes to merge into the row update.
-        Default: no-op.
+        """Optional hook for worker-specific side effects run after the
+        standard columns are computed. Returns extra header -> value writes
+        to merge into the row update. Default: no-op.
         """
         return {}

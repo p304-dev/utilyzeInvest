@@ -78,6 +78,14 @@ def select_queue(
     return queue
 
 
+def _flag_low_confidence(updates: dict[str, str], confidence: float, settings: Any) -> None:
+    if confidence < settings.confidence_min:
+        notes = updates.get("Research_Notes", "") or ""
+        low_conf_flag = f"[LOW CONFIDENCE: {confidence:.2f}] "
+        if not notes.startswith(low_conf_flag):
+            updates["Research_Notes"] = low_conf_flag + notes
+
+
 def _build_success_updates(
     row: dict[str, str],
     result: BaseModel,
@@ -87,13 +95,7 @@ def _build_success_updates(
     today: str,
 ) -> tuple[dict[str, str], str]:
     updates = worker.compute_business_updates(result, row, options.force_refresh)
-
-    confidence = getattr(result, "confidence")
-    if confidence < settings.confidence_min:
-        notes = updates.get("Research_Notes", "") or ""
-        low_conf_flag = f"[LOW CONFIDENCE: {confidence:.2f}] "
-        if not notes.startswith(low_conf_flag):
-            updates["Research_Notes"] = low_conf_flag + notes
+    _flag_low_confidence(updates, getattr(result, "confidence"), settings)
 
     route_value = worker.route(result)
 
@@ -102,6 +104,28 @@ def _build_success_updates(
     updates[worker.timestamp_column] = today
 
     updates.update(worker.after_research(row, result, route_value, settings))
+
+    return updates, BOT_STATUS_NEEDS_REVIEW
+
+
+def _build_recheck_updates(
+    row: dict[str, str],
+    result: BaseModel,
+    worker: Worker,
+    settings: Any,
+    options: RunnerOptions,
+    today: str,
+) -> tuple[dict[str, str], str]:
+    """A recheck only ever re-verifies a handful of fields (see the
+    worker's compute_recheck_updates) — it never recomputes routing or
+    triggers after_research(), since those depend on the full contact
+    picture a recheck doesn't re-derive. Whatever channel/drafts a full
+    research pass already produced are left exactly as they are."""
+    updates = worker.compute_recheck_updates(result, row, options.force_refresh)
+    _flag_low_confidence(updates, getattr(result, "confidence"), settings)
+
+    updates["Bot_Status"] = BOT_STATUS_NEEDS_REVIEW
+    updates[worker.timestamp_column] = today
 
     return updates, BOT_STATUS_NEEDS_REVIEW
 
@@ -190,19 +214,25 @@ def _process_row(
     today: str,
 ) -> str:
     row_number = row[ROW_NUMBER_KEY]
+    is_recheck = worker.wants_recheck(row)
 
-    prompt = worker.build_prompt(row, settings)
+    if is_recheck:
+        schema = worker.recheck_schema
+        prompt = worker.build_recheck_prompt(row, settings)
+        result: BaseModel | None = None  # cheap fetch-first targets output_schema, not this
+    else:
+        schema = worker.output_schema
+        prompt = worker.build_prompt(row, settings)
+        result = _try_cheap_extract(row, worker, llm_client, settings, prompt)
+
     errors: list[str] = []
-
-    result = _try_cheap_extract(row, worker, llm_client, settings, prompt)
-
     current_prompt = prompt
     for _attempt in range(_MAX_ATTEMPTS):
         if result is not None:
             break
         raw = llm_client.research(current_prompt)
         try:
-            result = parse_and_validate(raw, worker.output_schema)
+            result = parse_and_validate(raw, schema)
         except SchemaValidationError as exc:
             errors.append(str(exc))
             current_prompt = build_retry_prompt(prompt, exc)
@@ -220,13 +250,16 @@ def _process_row(
             },
             options.dry_run,
         )
-        log_event(logger, "row_error", row=row_number, reason=reason)
+        log_event(logger, "row_error", row=row_number, reason=reason, recheck=is_recheck)
         return BOT_STATUS_ERROR
 
-    updates, bot_status = _build_success_updates(row, result, worker, settings, options, today)
+    if is_recheck:
+        updates, bot_status = _build_recheck_updates(row, result, worker, settings, options, today)
+    else:
+        updates, bot_status = _build_success_updates(row, result, worker, settings, options, today)
     _assert_sentinels_filled(updates, row, worker)
     _write(sheets_client, worker, row_number, updates, options.dry_run)
-    log_event(logger, "row_processed", row=row_number, bot_status=bot_status)
+    log_event(logger, "row_processed", row=row_number, bot_status=bot_status, recheck=is_recheck)
     return bot_status
 
 

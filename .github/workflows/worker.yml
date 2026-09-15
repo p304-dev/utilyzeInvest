@@ -2,11 +2,17 @@ name: Automation Workers
 
 on:
   schedule:
-    # Biweekly: 09:00 UTC on the 1st and 15th. The sheet's queue formula
-    # makes runs self-limiting — the first few clear the ~968-row backfill
-    # at BATCH_SIZE rows apiece, then each run only picks up rows that
-    # went stale (Last Checked older than 90 days) or were newly added.
-    - cron: "0 9 1,15 * *"
+    # Weekly: 09:00 UTC every Monday. Bumped up from biweekly to clear the
+    # multi-thousand-row PULL VC DATA backlog faster (~3 months at
+    # BATCH_SIZE=250 vs ~6 at biweekly). This does NOT increase steady-state
+    # cost — a row only goes STALE after 90 days regardless of how often
+    # this fires, so recheck frequency per row is unaffected either way.
+    #
+    # TODO: once the backlog is cleared (queue_size in the run_summary log
+    # drops to roughly "new rows + rows going stale since last run" instead
+    # of thousands), drop this back down to biweekly or monthly — at that
+    # point weekly buys nothing but idle runs.
+    - cron: "0 9 * * 1"
   workflow_dispatch:
     inputs:
       worker:
@@ -63,11 +69,6 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GOOGLE_APPLICATION_CREDENTIALS: service-account.json
           SHEET_ID: ${{ secrets.SHEET_ID }}
-          # vars.* interpolates to "" (not unset) when the repo/environment
-          # variable was never configured — fall back explicitly so we
-          # never hand Settings a blank value for a typed field.
-          GMAIL_ENABLED: ${{ vars.GMAIL_ENABLED || 'false' }}
-          GMAIL_SENDER: ${{ vars.GMAIL_SENDER || 'ana.valentino@utilyze.ai' }}
         run: |
           ARGS="--worker ${{ matrix.worker }}"
           if [ -n "${{ inputs.batch }}" ]; then ARGS="$ARGS --batch ${{ inputs.batch }}"; fi

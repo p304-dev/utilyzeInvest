@@ -25,8 +25,6 @@ def _result(**overrides) -> VCResearchResult:
         twitter_url=None,
         newsletter=None,
         has_contact_form=False,
-        draft_subject="Hi",
-        draft_body="Hello",
         confidence=0.9,
         source_urls=["https://acme.vc"],
     )

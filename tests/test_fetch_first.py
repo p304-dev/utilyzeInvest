@@ -8,6 +8,7 @@ import json
 
 from config.settings import Settings
 from framework.runner import RunnerOptions, run
+from framework.worker_base import SENTINEL_VALUE
 from llm.fetch import html_to_text
 from tests.fixtures.fake_llm import FakeLLMClient
 from tests.fixtures.fake_sheets import FakeSheetsClient
@@ -29,8 +30,6 @@ _RICH = {
     "twitter_url": None,
     "newsletter": None,
     "has_contact_form": False,
-    "draft_subject": "Intro",
-    "draft_body": "Hello",
     "confidence": 0.9,
     "source_urls": ["https://acme.vc"],
     "notes": None,
@@ -88,8 +87,8 @@ def test_a_row_without_a_website_never_fetches(monkeypatch):
 
 
 def test_a_sentinel_website_is_not_treated_as_a_real_url(monkeypatch):
-    # "None" means researched-and-absent; fetching it would be nonsense.
-    llm = _run(monkeypatch, "unused", None, row=investors_row(Website="None"))
+    # The sentinel means researched-and-absent; fetching it would be nonsense.
+    llm = _run(monkeypatch, "unused", None, row=investors_row(Website=SENTINEL_VALUE))
     assert llm.extract_calls == []
     assert len(llm.calls) == 1
 
@@ -115,7 +114,7 @@ def test_page_hint_adds_a_scheme_when_the_sheet_omits_it():
     worker = VCResearchWorker()
     assert worker.page_hint({"Website": "acme.vc"}) == "https://acme.vc"
     assert worker.page_hint({"Website": "https://acme.vc"}) == "https://acme.vc"
-    assert worker.page_hint({"Website": "None"}) is None
+    assert worker.page_hint({"Website": SENTINEL_VALUE}) is None
     assert worker.page_hint({"Website": ""}) is None
 
 

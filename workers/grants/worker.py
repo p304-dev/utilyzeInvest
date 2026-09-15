@@ -10,7 +10,7 @@ Unlike the Investors tab, Grants / Pitches has no queue formula column, so
 this worker leaves `queue_column` unset and the runner falls back to
 scanning for blank business columns. The sentinel rule is likewise not
 applied here: without a COUNTBLANK-driven formula there is nothing to
-satisfy, and writing "None" into empty cells would only add noise.
+satisfy, and writing a sentinel into empty cells would only add noise.
 """
 
 from __future__ import annotations

@@ -16,3 +16,4 @@ credentials*.json
 *.json
 
 .DS_Store
+service-account-b64.txt

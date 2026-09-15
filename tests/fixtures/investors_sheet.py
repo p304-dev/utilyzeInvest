@@ -37,7 +37,6 @@ def investors_row(**overrides: str) -> dict[str, str]:
     """A blank Investors row, queued for work by default."""
     row = {header: "" for header in INVESTORS_HEADERS}
     row["Name"] = "Acme Ventures"
-    row["Category"] = "Investor"
     row["Deadline Formula"] = "PULL VC DATA"
     row.update(overrides)
     return row

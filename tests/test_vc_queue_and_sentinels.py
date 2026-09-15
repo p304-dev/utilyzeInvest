@@ -9,6 +9,7 @@ import json
 import pytest
 
 from config.settings import Settings
+from framework.worker_base import SENTINEL_VALUE
 from framework.runner import RunnerOptions, run, select_queue
 from tests.fixtures.fake_llm import FakeLLMClient
 from tests.fixtures.fake_sheets import FakeSheetsClient
@@ -29,6 +30,7 @@ def _response(**overrides) -> str:
         "website": "https://acme.vc",
         "industry_focus": "Climate",
         "stage": "Pre Seed",
+        "category": "Investor",
         "email": None,
         "phone": None,
         "city": "Austin",
@@ -39,8 +41,6 @@ def _response(**overrides) -> str:
         "twitter_url": None,
         "newsletter": None,
         "has_contact_form": False,
-        "draft_subject": "Intro",
-        "draft_body": "Hello there",
         "confidence": 0.9,
         "source_urls": ["https://acme.vc"],
         "notes": None,
@@ -111,9 +111,9 @@ def test_null_fields_become_sentinels_and_no_scanned_cell_is_left_blank():
     sheet, _ = _run(rows, [_response(phone=None, twitter_url=None, newsletter=None)])
 
     final = sheet.rows[0]
-    assert final["Phone"] == "None"
-    assert final["Twitter"] == "None"
-    assert final["Newsletter Yes/No"] == "None"
+    assert final["Phone"] == SENTINEL_VALUE
+    assert final["Twitter"] == SENTINEL_VALUE
+    assert final["Newsletter Yes/No"] == SENTINEL_VALUE
 
     blank = [h for h in SCANNED_HEADERS if not (final.get(h) or "").strip()]
     assert blank == [], f"scanned cells left blank (row would re-queue forever): {blank}"
@@ -122,19 +122,19 @@ def test_null_fields_become_sentinels_and_no_scanned_cell_is_left_blank():
 def test_empty_string_is_treated_as_null_for_the_sentinel():
     rows = [investors_row()]
     sheet, _ = _run(rows, [_response(phone="   ", newsletter="")])
-    assert sheet.rows[0]["Phone"] == "None"
-    assert sheet.rows[0]["Newsletter Yes/No"] == "None"
+    assert sheet.rows[0]["Phone"] == SENTINEL_VALUE
+    assert sheet.rows[0]["Newsletter Yes/No"] == SENTINEL_VALUE
 
 
 def test_sentinel_counts_as_filled_and_is_not_rewritten():
-    rows = [investors_row(Phone="None")]
+    rows = [investors_row(Phone=SENTINEL_VALUE)]
     sheet, _ = _run(rows, [_response(phone="+1-555-0100")])
     # Already researched-and-absent; a later run must not churn the cell.
-    assert sheet.rows[0]["Phone"] == "None"
+    assert sheet.rows[0]["Phone"] == SENTINEL_VALUE
 
 
 def test_force_refresh_replaces_a_sentinel_with_a_real_value():
-    rows = [investors_row(Phone="None")]
+    rows = [investors_row(Phone=SENTINEL_VALUE)]
     sheet, _ = _run(rows, [_response(phone="+1-555-0100")], force_refresh=True)
     assert sheet.rows[0]["Phone"] == "+1-555-0100"
 
@@ -143,6 +143,76 @@ def test_real_values_are_not_overwritten_without_force_refresh():
     rows = [investors_row(Website="https://existing.vc")]
     sheet, _ = _run(rows, [_response(website="https://new.vc")])
     assert sheet.rows[0]["Website"] == "https://existing.vc"
+
+
+# -- Industry Focus, Category, and Stage are constrained vocabularies ----
+
+
+def test_industry_focus_is_written_from_the_llm_response():
+    rows = [investors_row()]
+    sheet, _ = _run(rows, [_response(industry_focus="Climate")])
+    assert sheet.rows[0]["Industry Focus"] == "Climate"
+
+
+def test_unrecognized_industry_focus_falls_back_to_generalist():
+    rows = [investors_row()]
+    sheet, _ = _run(rows, [_response(industry_focus="Fintech")])
+    assert sheet.rows[0]["Industry Focus"] == "Generalist"
+
+
+def test_industry_focus_aliases_are_normalized_to_the_canonical_spelling():
+    rows = [investors_row()]
+    sheet, _ = _run(rows, [_response(industry_focus="bio-tech")])
+    assert sheet.rows[0]["Industry Focus"] == "Biotech"
+
+
+def test_water_is_a_valid_industry_focus():
+    rows = [investors_row()]
+    sheet, _ = _run(rows, [_response(industry_focus="Water")])
+    assert sheet.rows[0]["Industry Focus"] == "Water"
+
+
+def test_existing_industry_focus_is_not_overwritten_without_force_refresh():
+    rows = [investors_row(**{"Industry Focus": "Utilities"})]
+    sheet, _ = _run(rows, [_response(industry_focus="Climate")])
+    assert sheet.rows[0]["Industry Focus"] == "Utilities"
+
+
+def test_category_is_written_from_the_llm_response():
+    rows = [investors_row()]
+    sheet, _ = _run(rows, [_response(category="Grant")])
+    assert sheet.rows[0]["Category"] == "Grant"
+
+
+def test_unrecognized_category_falls_back_to_investor():
+    rows = [investors_row()]
+    sheet, _ = _run(rows, [_response(category="Fintech Fund")])
+    assert sheet.rows[0]["Category"] == "Investor"
+
+
+def test_category_aliases_are_normalized_to_the_canonical_spelling():
+    rows = [investors_row()]
+    sheet, _ = _run(rows, [_response(category="pitch competition")])
+    assert sheet.rows[0]["Category"] == "Pitch"
+
+
+def test_existing_category_is_not_overwritten_without_force_refresh():
+    rows = [investors_row(Category="Accelerator")]
+    sheet, _ = _run(rows, [_response(category="Grant")])
+    assert sheet.rows[0]["Category"] == "Accelerator"
+
+
+def test_a_stage_other_than_pre_seed_is_normalized_to_blank():
+    # "Series A" etc. must never land in the column as free text.
+    rows = [investors_row()]
+    sheet, _ = _run(rows, [_response(stage="Series A")])
+    assert sheet.rows[0]["Stage"] == SENTINEL_VALUE
+
+
+def test_pre_seed_stage_is_recognized_regardless_of_formatting():
+    rows = [investors_row()]
+    sheet, _ = _run(rows, [_response(stage="pre-seed")])
+    assert sheet.rows[0]["Stage"] == "Pre Seed"
 
 
 # -- what the runner writes, and what it must never touch ----------------
@@ -160,8 +230,7 @@ def test_human_and_formula_columns_are_never_written():
     rows = [investors_row()]
     sheet, _ = _run(rows)
     for _row_number, updates in sheet.write_calls:
-        for forbidden in ("Status", "Contact Date", "Category", "Deadline Formula",
-                          "Deadline Status"):
+        for forbidden in ("Status", "Contact Date", "Deadline Formula", "Deadline Status"):
             assert forbidden not in updates
 
 
